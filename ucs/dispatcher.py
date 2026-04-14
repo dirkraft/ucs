@@ -112,7 +112,7 @@ def _copy_credentials(name: str) -> None:
     container = _get_container(name)
     if container is None:
         return
-    container.exec_run("mkdir -p /root/.claude")
+    container.exec_run("mkdir -p /home/agent/.claude")
     with open(CREDENTIALS_SRC, "rb") as f:
         data = f.read()
     buf = io.BytesIO()
@@ -121,7 +121,7 @@ def _copy_credentials(name: str) -> None:
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
     buf.seek(0)
-    container.put_archive("/root/.claude", buf.read())
+    container.put_archive("/home/agent/.claude", buf.read())
     log.info("Credentials copied into %s", name)
 
 
@@ -145,7 +145,7 @@ async def run_agent(
 ) -> None:
     session_flag = "--name" if is_new_container else "--resume"
     cmd = [
-        "docker", "exec", "-i", cname,
+        "docker", "exec", cname,
         *CLAUDE_BASE_ARGS,
         session_flag, "root",
         prompt,
@@ -157,6 +157,14 @@ async def run_agent(
     last_active[cname] = time.monotonic()
 
     bullets: list[str] = []
+
+    async def _drain_stderr():
+        async for line in proc.stderr:
+            text = line.decode().strip()
+            if text:
+                log.warning("[%s stderr] %s", cname, text)
+
+    asyncio.create_task(_drain_stderr())
 
     try:
         async for raw_line in proc.stdout:
@@ -225,6 +233,11 @@ def build_app(config) -> AsyncApp:
     app = AsyncApp(token=config.slack.bot_token)
     authorized_ids = set(config.auth.authorized_user_ids)
 
+    @app.event("message")
+    async def handle_message():
+        # Slack sends message events alongside app_mention — acknowledged and ignored.
+        pass
+
     @app.event("app_mention")
     async def handle_mention(event, client):
         user = event.get("user", "")
@@ -262,9 +275,14 @@ def build_app(config) -> AsyncApp:
             await client.chat_update(channel=channel, ts=placeholder_ts, text="thinking…")
 
         is_new = ensure_container(cname)
-        asyncio.create_task(
-            run_agent(cname, prompt, is_new, channel, placeholder_ts, client)
-        )
+
+        async def _run():
+            try:
+                await run_agent(cname, prompt, is_new, channel, placeholder_ts, client)
+            except Exception:
+                log.exception("run_agent crashed for %s", cname)
+
+        asyncio.create_task(_run())
 
     return app
 

@@ -13,6 +13,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 RUN npm install -g @anthropic-ai/claude-code
 
-WORKDIR /workspace
+RUN useradd -m -s /bin/bash agent
+
+USER agent
+WORKDIR /home/agent
 
 CMD ["sleep", "infinity"]

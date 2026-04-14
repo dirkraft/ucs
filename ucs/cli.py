@@ -4,6 +4,7 @@ UCS CLI — stack management and other tooling.
 Entry point: ucs (defined in pyproject.toml)
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,19 @@ def up(restart):
     except ConfigError as e:
         raise click.ClickException(str(e))
 
+    # Check Docker image exists
+    docker_host = os.environ.get("DOCKER_HOST", f"unix:///run/user/{os.getuid()}/docker.sock")
+    result = subprocess.run(
+        ["docker", "image", "inspect", "ucs_agent_claude"],
+        capture_output=True,
+        env={**os.environ, "DOCKER_HOST": docker_host},
+    )
+    if result.returncode != 0:
+        raise click.ClickException(
+            "Docker image 'ucs_agent_claude' not found.\n"
+            f"Build it with: DOCKER_HOST={docker_host} docker build -t ucs_agent_claude docker/"
+        )
+
     if _tmux_session_exists(TMUX_SESSION):
         if not restart:
             raise click.ClickException(
@@ -80,8 +94,9 @@ def up(restart):
     log_path = LOGS_DIR / f"dispatcher-{timestamp}.log"
 
     python = sys.executable
+    docker_host = os.environ.get("DOCKER_HOST", f"unix:///run/user/{os.getuid()}/docker.sock")
     inner_cmd = (
-        f"PYTHONUNBUFFERED=1 {python} -m ucs.dispatcher 2>&1 | tee {log_path}"
+        f"PYTHONUNBUFFERED=1 DOCKER_HOST={docker_host} {python} -m ucs.dispatcher 2>&1 | tee {log_path}"
     )
 
     subprocess.run(
