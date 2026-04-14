@@ -92,3 +92,28 @@ def up(restart):
     click.echo(f"Stack started in tmux session '{TMUX_SESSION}'.")
     click.echo(f"Log: {log_path}")
     click.echo(f"Attach: tmux attach -t {TMUX_SESSION}")
+
+
+@stack.command()
+def down():
+    """Stop the UCS stack."""
+    if not _tmux_session_exists(TMUX_SESSION):
+        raise click.ClickException(f"Stack is not running (no tmux session '{TMUX_SESSION}').")
+    _kill_tmux_session(TMUX_SESSION)
+    click.echo(f"Stack stopped.")
+
+
+@stack.command()
+def status():
+    """Show whether the UCS stack is running and the latest log."""
+    running = _tmux_session_exists(TMUX_SESSION)
+    click.echo(f"Stack:   {'running' if running else 'stopped'}")
+
+    if LOGS_DIR.exists():
+        logs = sorted(LOGS_DIR.glob("dispatcher-*.log"))
+        if logs:
+            latest = logs[-1]
+            size = latest.stat().st_size
+            click.echo(f"Log:     {latest} ({size:,} bytes)")
+        else:
+            click.echo("Log:     none")
