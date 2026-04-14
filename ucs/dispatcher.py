@@ -204,6 +204,8 @@ async def run_agent(
     except asyncio.CancelledError:
         pass
     finally:
+        await proc.wait()
+        log.info("docker exec exited with code %s for %s", proc.returncode, cname)
         active_processes.pop(cname, None)
         last_active[cname] = time.monotonic()
         if proc.returncode is None:
@@ -275,6 +277,8 @@ def build_app(config) -> AsyncApp:
             await client.chat_update(channel=channel, ts=placeholder_ts, text="thinking…")
 
         is_new = ensure_container(cname)
+        if is_new:
+            await asyncio.sleep(1)  # let container settle before first exec
 
         async def _run():
             try:
