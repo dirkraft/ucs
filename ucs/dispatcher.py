@@ -13,7 +13,6 @@ import io
 import json
 import logging
 import os
-import re
 import tarfile
 import time
 from asyncio.subprocess import PIPE
@@ -132,6 +131,33 @@ def stop_container(name: str) -> None:
         container.stop()
 
 # ---------------------------------------------------------------------------
+# Integration context / system prompt
+# ---------------------------------------------------------------------------
+
+def build_system_prompt(ctx: dict) -> str:
+    source = ctx.get("source")
+    if source == "slack":
+        return (
+            "You are @pal, an AI agent operating inside a Slack workspace.\n\n"
+            "Integration context:\n"
+            f"  Source:  Slack\n"
+            f"  Team:    {ctx['team']}\n"
+            f"  Channel: {ctx['channel']}\n"
+            f"  Thread:  {ctx['thread_ts']}\n"
+            f"  User:    {ctx['user']}\n\n"
+            "Each Slack thread maps to a persistent session — messages in this thread "
+            "are continuations of the same conversation.\n\n"
+            "Formatting: use Slack mrkdwn in responses.\n"
+            "  Bold: *text*   Italic: _text_   Code: `code`   Block: ```code```\n"
+            "  Lists: use • or - bullets. Do not use # headers (not rendered in Slack).\n\n"
+            "You do not currently have Slack API tools — you cannot read channel history, "
+            "look up users, or send messages outside this thread. If asked to do something "
+            "requiring Slack API access, say so clearly."
+        )
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Stream parser
 # ---------------------------------------------------------------------------
 
@@ -142,11 +168,14 @@ async def run_agent(
     channel: str,
     placeholder_ts: str,
     client,
+    ctx: dict,
 ) -> None:
     session_flag = "--name" if is_new_container else "--resume"
+    system_prompt = build_system_prompt(ctx)
     cmd = [
         "docker", "exec", cname,
         *CLAUDE_BASE_ARGS,
+        *(["--append-system-prompt", system_prompt] if system_prompt else []),
         session_flag, "root",
         prompt,
     ]
@@ -198,6 +227,7 @@ async def run_agent(
                 final_text = ev.get("result", "").strip()
                 if ev.get("is_error") or not final_text:
                     final_text = f"_(error)_ {ev.get('result', 'unknown error')}"
+                log.info("[%s] response: %s", cname, final_text[:300])
                 await client.chat_update(channel=channel, ts=placeholder_ts, text=final_text)
                 break
 
@@ -227,10 +257,6 @@ async def _update_placeholder(client, channel: str, ts: str, bullets: list[str])
 # Slack app + event handlers
 # ---------------------------------------------------------------------------
 
-def _strip_mention(text: str) -> str:
-    return re.sub(r"<@[A-Z0-9]+>", "", text).strip()
-
-
 def build_app(config) -> AsyncApp:
     app = AsyncApp(token=config.slack.bot_token)
     authorized_ids = set(config.auth.authorized_user_ids)
@@ -249,7 +275,7 @@ def build_app(config) -> AsyncApp:
 
         channel = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
-        prompt = _strip_mention(event.get("text", ""))
+        prompt = event.get("text", "").strip()
 
         if not prompt:
             return
@@ -276,13 +302,21 @@ def build_app(config) -> AsyncApp:
                 active_processes.pop(cname, None)
             await client.chat_update(channel=channel, ts=placeholder_ts, text="thinking…")
 
+        ctx = {
+            "source": "slack",
+            "team": event.get("team", ""),
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "user": user,
+        }
+
         is_new = ensure_container(cname)
         if is_new:
             await asyncio.sleep(1)  # let container settle before first exec
 
         async def _run():
             try:
-                await run_agent(cname, prompt, is_new, channel, placeholder_ts, client)
+                await run_agent(cname, prompt, is_new, channel, placeholder_ts, client, ctx)
             except Exception:
                 log.exception("run_agent crashed for %s", cname)
 
