@@ -40,7 +40,7 @@ app_token = "xapp-..."   # Basic Information → App-Level Tokens (Socket Mode)
 [auth]
 # Slack user IDs allowed to trigger agent activity
 # Find yours: Slack profile → ⋮ → Copy member ID
-authorized_user_ids = ["U0ADZM4BQLE"]
+authorized_user_ids = ["UXXXXXXXXXX"]
 
 [docker]
 # Any Linux x86-64 image. Defaults to debian:bookworm-slim if not set.
