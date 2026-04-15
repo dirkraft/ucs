@@ -13,9 +13,12 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
 import tarfile
 import time
 from asyncio.subprocess import PIPE
+from pathlib import Path
 
 import docker as docker_sdk
 from slack_bolt.async_app import AsyncApp
@@ -29,10 +32,10 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DOCKER_IMAGE = "ucs_agent_claude"
 CONTAINER_MEMORY = "4g"
 IDLE_TIMEOUT_SECS = 300
 CREDENTIALS_SRC = os.path.expanduser("~/.claude/.credentials.json")
+AGENT_USER = "ucs-agent"
 
 CLAUDE_BASE_ARGS = [
     "claude",
@@ -52,6 +55,9 @@ active_processes: dict[str, asyncio.subprocess.Process] = {}
 # container_name -> last activity timestamp (monotonic)
 last_active: dict[str, float] = {}
 
+# container_name -> exec user (AGENT_USER if we created one, "" to use image default)
+agent_users: dict[str, str] = {}
+
 _docker_client = None
 
 
@@ -62,7 +68,40 @@ def docker_client():
     return _docker_client
 
 # ---------------------------------------------------------------------------
-# Docker helpers
+# CC binary helpers
+# ---------------------------------------------------------------------------
+
+def find_cc_binary() -> str | None:
+    """Return path to the local Claude Code standalone binary, or None."""
+    path = shutil.which("claude")
+    if path:
+        real = os.path.realpath(path)
+        if os.path.isfile(real) and os.access(real, os.X_OK):
+            return real
+    # Fallback: newest version in the default install dir
+    versions_dir = Path.home() / ".local" / "share" / "claude" / "versions"
+    if versions_dir.exists():
+        versions = sorted(v for v in versions_dir.iterdir() if v.is_file())
+        if versions:
+            return str(versions[-1])
+    return None
+
+
+def _copy_file_into_container(container, src_path: str, dest_dir: str, dest_name: str) -> None:
+    """Copy a host file into a container directory via put_archive."""
+    with open(src_path, "rb") as f:
+        data = f.read()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=dest_name)
+        info.size = len(data)
+        info.mode = 0o755
+        tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    container.put_archive(dest_dir, buf.read())
+
+# ---------------------------------------------------------------------------
+# Container setup
 # ---------------------------------------------------------------------------
 
 def container_name(thread_ts: str) -> str:
@@ -77,51 +116,103 @@ def _get_container(name: str):
         return None
 
 
-def ensure_container(name: str) -> bool:
+def setup_container(name: str, image: str, log_fn=None) -> bool:
     """
-    Ensure the container exists and is running.
-    Returns True if the container was just created (use --name root),
-    False if it already existed (use --resume root).
-    """
-    container = _get_container(name)
+    Ensure container exists, is running, has Claude Code installed, and has
+    a non-root exec user. Populates agent_users[name].
 
-    if container is None:
-        log.info("Creating container %s", name)
-        docker_client().containers.run(
-            DOCKER_IMAGE,
+    Returns True if the container was newly created (use --name root),
+    False if it already existed (use --resume root).
+
+    log_fn: optional callable(msg) for verbose output (used by config test).
+    """
+    emit = log_fn or (lambda msg: log.info(msg))
+
+    container = _get_container(name)
+    is_new = container is None
+
+    if is_new:
+        emit(f"Creating container {name} from {image}")
+        container = docker_client().containers.run(
+            image,
             name=name,
             detach=True,
             mem_limit=CONTAINER_MEMORY,
             command="sleep infinity",
         )
-        _copy_credentials(name)
-        return True
-
-    if container.status != "running":
-        log.info("Starting existing container %s", name)
+        time.sleep(1)  # let container settle
+    elif container.status != "running":
+        emit(f"Starting existing container {name}")
         container.start()
+        time.sleep(0.5)
 
-    return False
+    if is_new:
+        _install_agent(name, container, emit)
+
+    # Re-derive exec user on every setup call (handles dispatcher restarts)
+    agent_users[name] = _resolve_exec_user(name, container, emit)
+
+    return is_new
 
 
-def _copy_credentials(name: str) -> None:
+def _resolve_exec_user(name: str, container, emit) -> str:
+    """
+    Determine the user to exec as. If the container's default user is root,
+    ensure ucs-agent exists and return it. Otherwise return "" (use default).
+    """
+    result = container.exec_run("id -u")
+    uid = result.output.decode().strip()
+
+    if uid == "0":
+        # Running as root — ensure ucs-agent exists
+        r = container.exec_run(f"id {AGENT_USER}")
+        if r.exit_code != 0:
+            emit(f"Creating non-root user '{AGENT_USER}'")
+            container.exec_run(
+                f"useradd -m -s /bin/bash {AGENT_USER}",
+                user="root",
+            )
+        return AGENT_USER
+    else:
+        emit(f"Container default user is non-root (uid={uid}), using as-is")
+        return ""
+
+
+def _install_agent(name: str, container, emit) -> None:
+    """Install Claude Code binary and credentials into a fresh container."""
+    cc_binary = find_cc_binary()
+    if cc_binary is None:
+        raise RuntimeError(
+            "Claude Code binary not found on host. "
+            "Run: claude install"
+        )
+
+    emit(f"Installing Claude Code from {cc_binary}")
+    _copy_file_into_container(container, cc_binary, "/usr/local/bin", "claude")
+    emit("Claude Code installed")
+
+    _copy_credentials(name, container, emit)
+
+
+def _copy_credentials(name: str, container, emit) -> None:
     if not os.path.exists(CREDENTIALS_SRC):
         log.warning("Credentials file not found at %s", CREDENTIALS_SRC)
         return
-    container = _get_container(name)
-    if container is None:
-        return
-    container.exec_run("mkdir -p /home/agent/.claude")
-    with open(CREDENTIALS_SRC, "rb") as f:
-        data = f.read()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        info = tarfile.TarInfo(name=".credentials.json")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    buf.seek(0)
-    container.put_archive("/home/agent/.claude", buf.read())
-    log.info("Credentials copied into %s", name)
+
+    # Determine credential destination based on exec user
+    # We might not have agent_users populated yet during setup, so check directly
+    result = container.exec_run("id -u")
+    uid = result.output.decode().strip()
+    if uid == "0":
+        cred_home = f"/home/{AGENT_USER}"
+        container.exec_run(f"mkdir -p {cred_home}/.claude", user="root")
+    else:
+        result2 = container.exec_run("sh -c 'echo $HOME'")
+        cred_home = result2.output.decode().strip() or "/root"
+        container.exec_run(f"mkdir -p {cred_home}/.claude")
+
+    _copy_file_into_container(container, CREDENTIALS_SRC, f"{cred_home}/.claude", ".credentials.json")
+    emit(f"Credentials copied to {cred_home}/.claude")
 
 
 def stop_container(name: str) -> None:
@@ -172,8 +263,11 @@ async def run_agent(
 ) -> None:
     session_flag = "--name" if is_new_container else "--resume"
     system_prompt = build_system_prompt(ctx)
+    exec_user = agent_users.get(cname, "")
+    user_args = ["--user", exec_user] if exec_user else []
+
     cmd = [
-        "docker", "exec", cname,
+        "docker", "exec", *user_args, cname,
         *CLAUDE_BASE_ARGS,
         *(["--append-system-prompt", system_prompt] if system_prompt else []),
         session_flag, "root",
@@ -310,9 +404,7 @@ def build_app(config) -> AsyncApp:
             "user": user,
         }
 
-        is_new = ensure_container(cname)
-        if is_new:
-            await asyncio.sleep(1)  # let container settle before first exec
+        is_new = setup_container(cname, config.docker.image)
 
         async def _run():
             try:
@@ -338,6 +430,7 @@ async def idle_reaper():
             if now - last >= IDLE_TIMEOUT_SECS:
                 stop_container(cname)
                 last_active.pop(cname, None)
+                agent_users.pop(cname, None)
 
 # ---------------------------------------------------------------------------
 # Entry point

@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 
 from .config import CONFIG_PATH, ConfigError, load_config
+from .dispatcher import _get_container, find_cc_binary, setup_container
 
 LOGS_DIR = Path.home() / ".local" / "share" / "ucs" / "logs"
 TMUX_SESSION = "ucs-stack"
@@ -67,17 +68,11 @@ def up(restart):
     except ConfigError as e:
         raise click.ClickException(str(e))
 
-    # Check Docker image exists
-    docker_host = os.environ.get("DOCKER_HOST", f"unix:///run/user/{os.getuid()}/docker.sock")
-    result = subprocess.run(
-        ["docker", "image", "inspect", "ucs_agent_claude"],
-        capture_output=True,
-        env={**os.environ, "DOCKER_HOST": docker_host},
-    )
-    if result.returncode != 0:
+    # Check CC binary is available on host
+    if find_cc_binary() is None:
         raise click.ClickException(
-            "Docker image 'ucs_agent_claude' not found.\n"
-            f"Build it with: DOCKER_HOST={docker_host} docker build -t ucs_agent_claude docker/"
+            "Claude Code binary not found on host.\n"
+            "Run: claude install"
         )
 
     if _tmux_session_exists(TMUX_SESSION):
@@ -132,3 +127,109 @@ def status():
             click.echo(f"Log:     {latest} ({size:,} bytes)")
         else:
             click.echo("Log:     none")
+
+
+# ---------------------------------------------------------------------------
+# ucs shell
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("container")
+def shell(container):
+    """Shell into a UCS container by its full Docker container name."""
+    docker_host = os.environ.get("DOCKER_HOST", f"unix:///run/user/{os.getuid()}/docker.sock")
+    os.environ["DOCKER_HOST"] = docker_host  # ensure SDK picks it up
+
+    import docker as docker_sdk
+    try:
+        c = _get_container(container)
+    except docker_sdk.errors.DockerException as e:
+        raise click.ClickException(f"Docker error: {e}")
+
+    if c is None:
+        raise click.ClickException(f"No container found: '{container}'.")
+
+    if c.status != "running":
+        click.echo(f"Starting container {container}…")
+        c.start()
+
+    os.execvpe(
+        "docker",
+        ["docker", "exec", "-it", container, "/bin/bash"],
+        {**os.environ, "DOCKER_HOST": docker_host},
+    )
+
+
+# ---------------------------------------------------------------------------
+# ucs config
+# ---------------------------------------------------------------------------
+
+@cli.group("config")
+def config_group():
+    """Manage UCS configuration."""
+
+
+@config_group.command("test")
+def config_test():
+    """Test config and agent installation on the configured Docker image."""
+    docker_host = os.environ.get("DOCKER_HOST", f"unix:///run/user/{os.getuid()}/docker.sock")
+    os.environ["DOCKER_HOST"] = docker_host
+
+    try:
+        config = load_config()
+    except ConfigError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"Config:  {CONFIG_PATH}")
+    click.echo(f"Image:   {config.docker.image}")
+
+    cc_binary = find_cc_binary()
+    if cc_binary is None:
+        raise click.ClickException("Claude Code binary not found on host. Run: claude install")
+    click.echo(f"CC bin:  {cc_binary}")
+
+    import docker as docker_sdk
+    import uuid
+
+    test_name = f"ucs_test_{uuid.uuid4().hex[:8]}"
+    click.echo(f"\nSpinning up test container '{test_name}'…")
+
+    failed = False
+    try:
+        def emit(msg):
+            click.echo(f"  {msg}")
+
+        setup_container(test_name, config.docker.image, log_fn=emit)
+
+        # Verify claude runs
+        click.echo("  Verifying claude --version inside container…")
+        import docker as docker_sdk
+        container = _get_container(test_name)
+        exec_user = __import__("ucs.dispatcher", fromlist=["agent_users"]).agent_users.get(test_name, "")
+        result = container.exec_run(
+            "claude --version",
+            user=exec_user or None,
+        )
+        output = result.output.decode().strip()
+        if result.exit_code != 0:
+            click.echo(f"  ✗ claude --version failed (exit {result.exit_code}): {output}", err=True)
+            failed = True
+        else:
+            click.echo(f"  ✓ {output}")
+
+    except Exception as e:
+        click.echo(f"  ✗ {e}", err=True)
+        failed = True
+    finally:
+        click.echo(f"\nCleaning up test container…")
+        try:
+            c = _get_container(test_name)
+            if c:
+                c.remove(force=True)
+                click.echo("  Removed.")
+        except Exception as e:
+            click.echo(f"  Warning: could not remove test container: {e}")
+
+    if failed:
+        raise click.ClickException("Config test failed.")
+    click.echo("\n✓ Config test passed.")

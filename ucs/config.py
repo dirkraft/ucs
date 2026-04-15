@@ -3,10 +3,12 @@ Config loading from ~/.config/ucs/config.toml.
 """
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "ucs" / "config.toml"
+
+DEFAULT_DOCKER_IMAGE = "debian:bookworm-slim"
 
 TEMPLATE = """\
 [slack]
@@ -20,6 +22,12 @@ app_token = ""
 # Slack user IDs allowed to trigger agent activity.
 # Find a user's ID: Slack profile → ⋮ → Copy member ID
 authorized_user_ids = []
+
+[docker]
+# Docker image to use for agent containers.
+# Any Linux x86-64 image works — the dispatcher installs Claude Code at container creation.
+# Defaults to debian:bookworm-slim if not set.
+# image = "your-org/your-image:tag"
 """
 
 
@@ -39,9 +47,15 @@ class AuthConfig:
 
 
 @dataclass
+class DockerConfig:
+    image: str = DEFAULT_DOCKER_IMAGE
+
+
+@dataclass
 class UCSConfig:
     slack: SlackConfig
     auth: AuthConfig
+    docker: DockerConfig = field(default_factory=DockerConfig)
 
 
 def load_config() -> UCSConfig:
@@ -91,7 +105,11 @@ def load_config() -> UCSConfig:
         bullet_list = "\n".join(f"  • {e}" for e in errors)
         raise ConfigError(f"Config validation failed ({CONFIG_PATH}):\n{bullet_list}")
 
+    docker_raw = raw.get("docker", {})
+    docker_image = docker_raw.get("image", DEFAULT_DOCKER_IMAGE)
+
     return UCSConfig(
         slack=SlackConfig(bot_token=bot_token, app_token=app_token),
         auth=AuthConfig(authorized_user_ids=authorized_user_ids),
+        docker=DockerConfig(image=docker_image),
     )
