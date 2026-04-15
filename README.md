@@ -1,4 +1,4 @@
-# UCS — Universal Container Session
+# UCS
 
 UCS maps conversational threads to persistent Docker containers running [Claude Code](https://claude.ai/code). Each thread gets its own container; the container is the session.
 
